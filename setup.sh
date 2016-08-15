@@ -48,14 +48,14 @@ fi
 return 1
 }
 
-function test_mysql_utilities () {
+function test_db2_utilities () {
 local exe=""
 
-for exe in mysql
+for exe in db2
 do 
 	if ( ! type $exe >> $LOG 2>&1 )
 	then
-		msg FATAL "Please validate your environment. Mysql is not executable in current \$PATH"
+		msg FATAL "Please validate your environment. db2 is not executable in current \$PATH"
 		return 1
 	fi
 done
@@ -70,11 +70,12 @@ local ret=0
 msg NOTIFY ""
 msg NOTIFY ""
 msg NOTIFY ""
-msg NOTIFY "Test connectivity with: mysql $constring"
+msg NOTIFY "Test connectivity with: db2 $constring"
 msg NOTIFY ""
 msg NOTIFY ""
 
-mysql $constring -e 'SELECT version();' 
+db2 $constring
+db2 "SELECT service_level, fixpack_num FROM TABLE (sysproc.env_get_inst_info()) as INSTANCEINFO"
 
 ret=$?
 
@@ -93,17 +94,12 @@ then
 	return 1
 fi
 
-mysql $constring -t <<EOF > ${outfile}
+db2 $constring
+db2 -t <<EOF > ${outfile}
 
-SELECT concat(table_schema,'.',table_name) "schema.table_name",
-    concat(round(table_rows/1000000,2),'M') rows,
-    concat(round(data_length/(1024*1024*1024),2),'G') DATA,
-    concat(round(index_length/(1024*1024*1024),2),'G') idx,
-    concat(round((data_length+index_length)/(1024*1024*1024),2),'G') total_size,
-    round(index_length/data_length,2) idxfrac 
-FROM information_schema.TABLES 
-WHERE table_name = 'cf1'
-ORDER BY table_schema;
+select a.tabname,tabschema, (a.fpages*PAGESIZE/1024) as size_k, a.card
+from syscat.tables a, syscat.tablespaces b where
+a.TBSPACEID=b.TBSPACEID and a.tabname='CF1';
 
 EOF
 
@@ -116,13 +112,19 @@ local constring="$1"
 local num_processed=0
 local x=1
 
+echo "set SCHEMA user1" >> drop_databases_users.sql
+echo "DROP procedure user1.load_base_table_data" >> drop_databases_users.sql
 for (( x=1 ; x < 4096 ; x++ ))
 do
-        echo "DROP DATABASE user${x};" >> drop_databases_users.sql
-        echo "DROP USER user${x}@'localhost', user${x}@'%';" >> drop_databases_users.sql
+        echo "set SCHEMA user${x}" >> drop_databases_users.sql
+        echo "DROP table cf1" >> drop_databases_users.sql
+        echo "DROP procedure user${x}.slobupdate" >> drop_databases_users.sql
+        echo "DROP procedure user${x}.sleep" >> drop_databases_users.sql
+        echo "DROP procedure user${x}.slob" >> drop_databases_users.sql
 done
 
-mysql $constring -vvv < drop_databases_users.sql 2>&1 | tee -a /tmp/XX |  grep -i "Query OK" | wc -l  | while read num_processed
+db2 $constring
+db2 -sf drop_databases_users.sql 2>&1 | tee -a /tmp/XX |  grep -i "successfully" | wc -l  | while read num_processed
 do
 	msg NOTIFY "Deleted `expr ${num_processed} / 2` SLOB schemas."
 done
@@ -130,43 +132,17 @@ done
 return 0
 }
 
-function grant() {
-local user=$1
-local constring="$2" 
-
-local ret=0
-
-mysql $constring -vvv <<EOF
-create database ${user};
-grant all privileges on ${user}.* to ${user}@'localhost' identified by '${user}' with grant option;
-grant all privileges on ${user}.* to ${user}@'%' identified by '${user}' with grant option;
-EOF
-
-if [ "$user" != "user1" ]
-then
-mysql $constring -vvv <<EOF
-    grant all privileges on user1.* to ${user}@'localhost';
-    grant all privileges on user1.* to ${user}@'%';
-EOF
-
-fi
-
-ret=$?
-
-# Leave behind a cleanup script
-return $ret
-}
-
 function load_base_table () {
 local user=$1
-local pass=$2
+local constring=$2
 local ret=0
 
-mysql -u$user -p$pass $NON_ADMIN_CONNECT_STRING <<EOF
-SET autocommit = 0;
-use ${user};
+echo "load_base_table"
+echo $constring
+db2 $constring
+db2  -vtd@ <<EOF
+set schema ${user}@
 
-DELIMITER //
 CREATE PROCEDURE load_base_table_data()
 BEGIN
 declare nrows   int default 1;
@@ -182,30 +158,33 @@ while nrows <= ${SCALE} DO
 
 END while;
 COMMIT;
-END //
+END 
+@
 
-DELIMITER ;
+call ${user}.load_base_table_data()@
 
-call load_base_table_data();
+select count(*) from cf1@
 
 EOF
 
 ret=$?
-return $ret
+
+return 0
 
 }
 
 function load_normal_table() {
 local user=$1
-local pass=$2
+local constring=$2
 local ret=0
 
-mysql -u${user} -p${pass} ${NON_ADMIN_CONNECT_STRING} -vvv <<EOF
-use ${user};
+db2 $constring
+db2  -v <<EOF
+set schema ${user}
 
-INSERT INTO cf1 select * from user1.cf1;
+INSERT INTO cf1 select * from user1.cf1
 
-COMMIT;
+COMMIT
 
 EOF
 ret=$?
@@ -214,28 +193,16 @@ return $ret
 
 function create_table() {
 local user=$1
-local pass=$2
+local constring=$2
 local ret=0
 
-if [ ! -z "${INNODB_DATA_PATH}" ]
-then
-    create_table_clause="engine=innodb data directory='${INNODB_DATA_PATH}'"
-else
-    create_table_clause=""
-fi
 
-mysql -u${user} -p${pass} ${NON_ADMIN_CONNECT_STRING} <<EOF
-use ${user};
+db2 $constring
 
-CREATE TABLE cf1
-(
-custid int primary key, c2 VARCHAR(128), c3 VARCHAR(128) , 
-c4 VARCHAR(128) , c5 VARCHAR(128) , c6 VARCHAR(128) ,
-c7 VARCHAR(128) , c8 VARCHAR(128) , c9 VARCHAR(128) ,
-c10 VARCHAR(128) , c11 VARCHAR(128) , c12 VARCHAR(128) ,
-c13 VARCHAR(128) , c14 VARCHAR(128) , c15 VARCHAR(128) ,
-c16 VARCHAR(128) , c17 VARCHAR(128) , c18 VARCHAR(128) ,
-c19 VARCHAR(128) , c20 VARCHAR(128) ) ${create_table_clause};
+db2 -vt <<EOF
+set schema ${user};
+
+CREATE TABLE cf1 ( custid int not null primary key, c2 VARCHAR(128), c3 VARCHAR(128) , c4 VARCHAR(128) , c5 VARCHAR(128) , c6 VARCHAR(128) , c7 VARCHAR(128) , c8 VARCHAR(128) , c9 VARCHAR(128) , c10 VARCHAR(128) , c11 VARCHAR(128) , c12 VARCHAR(128) , c13 VARCHAR(128) , c14 VARCHAR(128) , c15 VARCHAR(128) , c16 VARCHAR(128) , c17 VARCHAR(128) , c18 VARCHAR(128) , c19 VARCHAR(128) , c20 VARCHAR(128) );
 EOF
 
 ret=$?
@@ -244,17 +211,16 @@ return $ret
 
 function cr_slob_procedure() {
 local user=$1
-local pass=$2
+local constring=$2
 local ret=0
 
-echo "Connecting via \"mysql -u${user} -p${pass} ${NON_ADMIN_CONNECT_STRING}\" "
+db2 $constring
 
-mysql -u${user} -p${pass} ${NON_ADMIN_CONNECT_STRING} <<EOF
+db2 -vtd@ <<EOF
 
-use ${user};
+set schema ${user}@
 
-DELIMITER //
-CREATE PROCEDURE slobupdate (pv_random int, pv_work_unit int, pv_redo_stress VARCHAR(10)) 
+CREATE PROCEDURE ${user}.slobupdate (pv_random int, pv_work_unit int, pv_redo_stress VARCHAR(10))
 BEGIN
 
 IF  (pv_redo_stress = 'HEAVY')  THEN
@@ -281,15 +247,25 @@ IF  (pv_redo_stress = 'HEAVY')  THEN
     WHERE  custid >  ( pv_random - pv_work_unit ) AND  ( custid < pv_random);
     COMMIT;
 ELSE
-    UPDATE cf1 SET 
+    UPDATE cf1 SET
     c2  = 'AAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBB',
     c20 = 'AAAAAAAABBBBBBBBAAAAAAAA0BBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBBBBBBAAAAAAAABBBB0BBBAAAAAAAABBBBBBBBAAAAAAAABBBBB3BBAAAAAAAABBBB5BBB'
     WHERE  ( custid >  ( pv_random - pv_work_unit )) AND  (custid < pv_random);
     COMMIT;
 END IF;
-END //
+END @
 
-create procedure slob(p_update_pct int, p_max_loop_iterations int, p_run_time int, p_scale int, p_work_unit int, p_redo_stress varchar(10),
+CREATE OR REPLACE PROCEDURE ${user}.SLEEP(seconds INTEGER)
+BEGIN
+  DECLARE end TIMESTAMP;
+  SET end = CURRENT TIMESTAMP + seconds SECONDS;
+wait:  LOOP
+    IF CURRENT TIMESTAMP >= end THEN LEAVE wait; END IF;
+  END LOOP wait;
+END
+@
+
+create procedure ${user}.slob(p_update_pct int, p_max_loop_iterations int, p_run_time int, p_scale int, p_work_unit int, p_redo_stress varchar(10),
 p_shared_data_modulus int, p_do_update_hotspot boolean, p_hotspot_pct int, p_sleep_modulus int, p_think_tm_min float, p_think_tm_max float)
 begin
 declare v_num_tmp float default 0;
@@ -300,11 +276,11 @@ declare v_updates int default 0;
 declare v_selects int default 0;
 declare v_random_block int default 1;
 declare v_tmp int;
-declare v_now int unsigned;
-declare v_brick_wall int unsigned;
+declare v_now int;
+declare v_brick_wall int;
 
-declare v_begin_time int unsigned;
-declare v_end_time int unsigned;
+declare v_begin_time int;
+declare v_end_time int;
 declare v_total_time int;
 
 declare v_do_sleeps BOOLEAN default FALSE;
@@ -334,16 +310,16 @@ END IF;
 
 IF ( p_update_pct = 0 ) THEN
     set v_select_only_workload = TRUE;
-END IF; 
+END IF;
 
 IF ( p_update_pct = 100 ) THEN
     set v_update_only_workload = TRUE;
-END IF; 
+END IF;
 
 set v_update_quota = FALSE ;
 set v_select_quota = FALSE ;
 
-set v_begin_time = UNIX_TIMESTAMP();
+set v_begin_time = (select timestampdiff(2, char(current timestamp - timestamp('1970-01-01-00.00.00'))) from sysibm.sysdummy1);
 set v_now = v_begin_time ;
 set v_brick_wall = v_now + p_run_time;
 
@@ -352,10 +328,10 @@ while ( v_now < v_brick_wall AND v_stop_immediate != TRUE )  DO
 
     IF ( v_do_sleeps = TRUE ) AND ( MOD( v_random_block, p_sleep_modulus ) = 0 ) THEN
         set v_num_tmp = FLOOR(p_think_tm_min + RAND() * (p_think_tm_max - p_think_tm_min));
-        select sleep(v_num_tmp);
+        call ${user}.sleep(v_num_tmp);
     END IF;
 
-    IF  ( v_select_only_workload = TRUE ) THEN 
+    IF  ( v_select_only_workload = TRUE ) THEN
         -- handle case where user specified zero pct updates
         set v_do_update = FALSE;
         set v_update_quota = TRUE ;
@@ -364,28 +340,28 @@ while ( v_now < v_brick_wall AND v_stop_immediate != TRUE )  DO
         IF ( v_update_only_workload = TRUE ) THEN
             set v_do_update = TRUE;
             set v_update_quota = FALSE;
-        ELSE            
+        ELSE
             IF ( v_update_quota = FALSE ) THEN
                 -- We are doing updates during this run and quota has not been met yet
                 -- We still vacilate until update quota has been met
-                set v_do_update = FALSE;   
+                set v_do_update = FALSE;
 
                 IF ( MOD(v_random_block, 2) = 0 ) THEN
                     set v_do_update = TRUE;
                 END IF;
             ELSE
                 -- UPDATE quota has been filled, force drain some SELECTs
-                set v_do_update = FALSE; 
+                set v_do_update = FALSE;
             END IF;
         END IF;
 
     END IF;
-    
+
     IF ( v_do_update = TRUE ) THEN
         set v_updates = v_updates + 1;
 
         IF ( v_updates >= p_update_pct ) THEN
-            set v_update_quota = TRUE; 
+            set v_update_quota = TRUE;
         END IF;
 
         IF ( p_do_update_hotspot = TRUE ) THEN
@@ -395,13 +371,13 @@ while ( v_now < v_brick_wall AND v_stop_immediate != TRUE )  DO
         END IF;
 
         IF (v_do_shared_data = TRUE) AND ( MOD(v_loop_cnt, p_shared_data_modulus) = 0 ) THEN
-            call user1.slobupdate( v_random_block, p_work_unit, p_redo_stress ); 
+          call user1.slobupdate( v_random_block, p_work_unit, p_redo_stress );
         ELSE
-            call slobupdate( v_random_block, p_work_unit, p_redo_stress ); 
+            call ${user}.slobupdate( v_random_block, p_work_unit, p_redo_stress );
         END IF;
 
     ELSE
-        set v_selects = v_selects + 1;     
+        set v_selects = v_selects + 1;
         set v_random_block = FLOOR(p_work_unit+1 + RAND() * (p_scale - p_work_unit -1));
 
         IF (v_do_shared_data = TRUE) AND ( MOD(v_loop_cnt, p_shared_data_modulus) = 0 ) THEN
@@ -414,7 +390,7 @@ while ( v_now < v_brick_wall AND v_stop_immediate != TRUE )  DO
 
     IF ( v_select_only_workload != TRUE ) AND ( ( v_updates + v_selects ) >=  100 ) THEN
         set v_update_quota = FALSE;
-        set v_select_quota = FALSE;    
+        set v_select_quota = FALSE;
         set v_updates = 0;
         set v_selects = 0;
     END IF;
@@ -426,16 +402,17 @@ while ( v_now < v_brick_wall AND v_stop_immediate != TRUE )  DO
             set v_stop_immediate = TRUE ;
     END IF;
 
-    set v_now = UNIX_TIMESTAMP();
+    set v_now = (select timestampdiff(2, char(current timestamp - timestamp('1970-01-01-00.00.00'))) from sysibm.sysdummy1);
 
 END while;
- 
+
 set v_end_time = v_now ;
 set v_total_time = v_end_time - v_begin_time ;
-set v_scratch = concat(user(),  '|',  v_total_time );
-select v_scratch "user|total_time";
+--set v_scratch = concat(user(),  '|',  v_total_time );
+--DBMS_OUTPUT.PUT_LINE(v_scratch);
 
-END //
+END
+@
 
 EOF
 
@@ -446,11 +423,11 @@ return $ret
 
 function setup() {
 local user=$1
-local pass=$2
+local constring=$2
 
 msg NOTIFY "Creating SLOB table for schema ${user}"
 
-if ( ! create_table $user $pass >> $LOG 2>&1 )
+if ( ! create_table $user "$constring">> $LOG 2>&1 )
 then
 	msg FATAL "Failed to create table for ${user}."
 	return 1
@@ -458,13 +435,13 @@ fi
 
 if [ "$user" = "user1" ]
 then
-	if ( ! load_base_table $user $pass >> $LOG 2>&1 )
+	if ( ! load_base_table $user "$constring" >> $LOG 2>&1 )
 	then
 		msg FATAL "Failed to load ${user} SLOB table."
 		return 1
 	fi
 else
-	if ( ! load_normal_table $user $pass >> $LOG 2>&1 )
+	if ( ! load_normal_table $user "$constring" >> $LOG 2>&1 )
 	then
 		msg FATAL "Failed to load ${user} SLOB table."
 		return 1			
@@ -537,7 +514,7 @@ then
 	exit 1
 fi
 
-if ( ! test_mysql_utilities )
+if ( ! test_db2_utilities )
 then
 	msg FATAL "Abort. See ${LOG}."
 	exit 1
@@ -581,46 +558,50 @@ else
 fi
 
 conn_string=""
-if [ ! -z "${MYSQL_HOST}" ]
+
+if [ ! -z "${DB_NAME}" ]
 then
-    conn_string="-h ${MYSQL_HOST}"
+    conn_string="connect to ${DB_NAME}"
 fi
 
-if [ ! -z "${MYSQL_PORT}" ]
+if [ ! -z "${DB2_USER}" ]
 then
-    conn_string="${conn_string} -P ${MYSQL_PORT}"
+    conn_string="${conn_string} user ${DB2_USER}"
 fi
 
-export ADMIN_CONNECT_STRING="-uroot -p${MYSQL_ROOT_PWD} ${conn_string}"
+if [ ! -z "${DB2_PASS}" ]
+then
+    conn_string="${conn_string} using ${DB2_PASS}"
+fi
+
 export NON_ADMIN_CONNECT_STRING="${conn_string}"
+export ADMIN_CONNECT_STRING="${conn_string}"
 
 msg NOTIFY "Load parameters from slob.conf: "
 
 msg NOTIFY "LOAD_PARALLEL_DEGREE == \"$LOAD_PARALLEL_DEGREE\""
 msg NOTIFY "SCALE == \"$SCALE\""
-msg NOTIFY "INNODB_DATA_PATH == \"$INNODB_DATA_PATH\""
 msg NOTIFY "ADMIN_CONNECT_STRING == \"$ADMIN_CONNECT_STRING\""
 msg NOTIFY "NON_ADMIN_CONNECT_STRING == \"$NON_ADMIN_CONNECT_STRING\""
 
 msg NOTIFY ""
-msg NOTIFY "Testing connectivity to mysql to validate slob.conf settings."
+msg NOTIFY "Testing connectivity to db2 to validate slob.conf settings."
 msg NOTIFY "Testing Admin connect using \"$ADMIN_CONNECT_STRING\""
 
 if ( ! test_conn "$ADMIN_CONNECT_STRING" >> $LOG 2>&1  )
 then
-	msg FATAL "${0}: cannot connect to mysql."
+	msg FATAL "${0}: cannot connect to db2."
 	msg FATAL "Check $LOG log file for more information"
-	msg FATAL "Please verify mysql is running and the settings"
+	msg FATAL "Please verify db2 is running and the settings"
 	msg FATAL "in slob.conf are correct for your connectivity model."
 
 	exit 1
 else
-	msg NOTIFY "${0}: Successful test connection: \"mysql $ADMIN_CONNECT_STRING\""
+	msg NOTIFY "${0}: Successful test connection: \"db2 $ADMIN_CONNECT_STRING\""
 	msg NOTIFY " "	
 fi
 
 USER=""
-PASS=""
 
 cnt=1
 groupcnt=0
@@ -641,19 +622,13 @@ msg NOTIFY "Preparing to load $MAXUSER schema(s)"
 while [ $cnt -le $MAXUSER ]
 do
 	USER=user$cnt
-	PASS=user$cnt
 
 	if [ $cnt -eq 1 ]
 	then
-		if ( ! grant $USER "$ADMIN_CONNECT_STRING" >> $LOG  2>&1 )
-		then
-			msg FATAL "Cannot create ${USER} schema. See ${LOG}."
-			exit 1
-		fi
 
 		msg NOTIFY "Loading $USER schema."
 		before_load_ts=$SECONDS
-		if ( ! setup $USER $PASS >> $LOG 2>&1 )
+		if ( ! setup $USER "$ADMIN_CONNECT_STRING" >> $LOG 2>&1 )
 		then
 			msg FATAL "Cannot load $USER schema"
 			msg FATAL "See $LOG"
@@ -666,15 +641,7 @@ do
 		msg NOTIFY "Beginning concurrent load phase."
 	else
 
-
-		if ( ! grant $USER "$ADMIN_CONNECT_STRING" >> $LOG  2>&1 )
-		then
-			msg FATAL "Cannot create ${USER} schema. See ${LOG}."
-			exit 1
-		fi
-
-		( setup $USER $PASS >> $LOG 2>&1 || flag_abort $ABORT_FLAG_FILE ) &
-
+		( setup $USER "$ADMIN_CONNECT_STRING" >> $LOG 2>&1 || flag_abort $ABORT_FLAG_FILE ) &
 
 		if [ $x -eq $(( LOAD_PARALLEL_DEGREE - 1 ))  ] 
 		then
@@ -708,7 +675,7 @@ msg NOTIFY "Creating SLOB procedure."
 x=1
 for (( x=1 ; x <= ${MAXUSER} ; x++ ))
 do
-    cr_slob_procedure user${x} user${x} >> $LOG 2>&1
+    cr_slob_procedure user${x} "$ADMIN_CONNECT_STRING" >> $LOG 2>&1
 done
 
 wait

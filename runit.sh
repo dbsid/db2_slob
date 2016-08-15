@@ -22,20 +22,20 @@ echo "${type} : ${now} : ${msg}"
 
 function test_conn() {
 local constring="$*"
-local ret=""
-local outfile=/tmp/.${$}.${RANDOM}
+local ret=0
 
-mysql $constring -e 'SELECT version();' > $outfile 2>&1
+msg NOTIFY ""
+msg NOTIFY ""
+msg NOTIFY ""
+msg NOTIFY "Test connectivity with: db2 $constring"
+msg NOTIFY ""
+msg NOTIFY ""
+
+db2 $constring
+db2 "SELECT service_level, fixpack_num FROM TABLE (sysproc.env_get_inst_info()) as INSTANCEINFO"
 
 ret=$?
 
-if [ $ret -ne 0 ]
-then
-	msg FATAL "Instance connectivity check failed. mysql output:"
-	cat $outfile
-fi
-
-rm -f $outfile
 return $ret
 }
 
@@ -47,6 +47,35 @@ ps -p `cat $pidfile` | wc -l
 return 0
 
 }
+
+function reset_snapshot() {
+local constring="$1"
+local dbname="$2"
+local ret=0
+
+db2 $constring
+db2 "reset monitor for database ${dbname} global"
+
+ret=$?
+
+return $ret
+
+}
+
+function get_snapshot() {
+local constring="$1"
+local dbname="$2"
+local ret=0
+
+db2 $constring
+db2 "get snapshot for database on ${dbname}"
+
+ret=$?
+
+return $ret
+
+}
+
 
 
 function wait_pids() {
@@ -65,7 +94,7 @@ echo "$pids" > $pid_file 2>&1
 
 if [ "$wl" -eq 0 ]
 then
-	msg NOTIFY "List of monitored mysql PIDs written to $pid_file"
+	msg NOTIFY "List of monitored db2 PIDs written to $pid_file"
 
 	monitor_limit=300
 
@@ -74,7 +103,7 @@ then
 
 	if [ $tmp -lt $sessions ]
 	then
-		msg FATAL "SLOB process monitoring discovered $(( sessions - tmp )) mysql processes have aborted."
+		msg FATAL "SLOB process monitoring discovered $(( sessions - tmp )) db2 processes have aborted."
 		msg FATAL "Consider export SLOB_DEBUG=TRUE, re-running the test and then examine slob_debug.out"
 		rm -f $pid_file
 		return 1
@@ -96,7 +125,7 @@ do
 	then
 		if [ "$cnt" -gt $monitor_limit ]
 		then
-			msg FATAL "The following mysql processes have not exited after $monitor_limit seconds."
+			msg FATAL "The following db2 processes have not exited after $monitor_limit seconds."
 			ps -fp $pids
 			return 1
 		fi
@@ -106,7 +135,7 @@ do
 	if [ $x = 0 ]
 	then
 		tmp=`count_pids $pid_file`		
-		msg NOTIFY "There are $tmp mysql processes remaining."
+		msg NOTIFY "There are $tmp db2 processes remaining."
 	fi	
 
 	sleep 1
@@ -139,7 +168,6 @@ done
 return 0
 }
 
-
 #---------- Main body
 
 if [[ "$#" != 1 || "$1" < 1 ]]
@@ -152,6 +180,10 @@ then
 else
 	sessions=$1
 fi
+
+export WORK_DIR=`pwd`
+export SNAPSHOT=${WORK_DIR=}/snapshot.out
+export LOG=${WORK_DIR=}/runit.out
 
 SLOB_DEBUG=TRUE
 if [ "$SLOB_DEBUG" = "TRUE" ]
@@ -179,14 +211,14 @@ then
 	exit 1
 fi
 
-if ( ! type mysql  >> $debug_outfile 2>&1 )
+if ( ! type db2  >> $debug_outfile 2>&1 )
 then
-	msg FATAL "mysql is not executable in $PATH"
+	msg FATAL "db2 is not executable in $PATH"
 	msg FATAL "SLOB abnormal end."
 	exit 1
 fi
 
-rm -f  iostat.out vmstat.out mpstat.out slob_debug.out mystat.out *_slob.pids.out
+rm -f  iostat.out vmstat.out mpstat.out slob_debug.out *_slob.pids.out
 
 # Just in case user deleted lines in slob.conf:
 UPDATE_PCT=${UPDATE_PCT:=25}
@@ -204,13 +236,10 @@ THINK_TM_MODULUS=${THINK_TM_MODULUS:=0}
 THINK_TM_MIN=${THINK_TM_MIN:=.1}
 THINK_TM_MAX=${THINK_TM_MAX:=.5}
 
-MYSQL_ROOT_PWD=${MYSQL_ROOT_PWD:=""}
-MYSQL_HOST=${MYSQL_HOST:=""}
-MYSQL_PORT=${MYSQL_PORT:=""}
 
 source ./slob.conf
 
-mysql_pids=""
+db2_pids=""
 misc_pids=""
 before=""
 tm=""
@@ -224,27 +253,24 @@ instance=1
 sessions_per_instance=0
 
 conn_string=""
-if [ ! -z "${MYSQL_HOST}" ]
+
+if [ ! -z "${DB_NAME}" ]
 then
-    conn_string="-h ${MYSQL_HOST}"
+    conn_string="connect to ${DB_NAME}"
 fi
 
-if [ ! -z "${MYSQL_PORT}" ]
+if [ ! -z "${DB2_USER}" ]
 then
-    conn_string="${conn_string} -P ${MYSQL_PORT}"
+    conn_string="${conn_string} user ${DB2_USER}"
 fi
 
-export admin_connect_string="-uroot -p${MYSQL_ROOT_PWD} ${conn_string}"
+if [ ! -z "${DB2_PASS}" ]
+then
+    conn_string="${conn_string} using ${DB2_PASS}"
+fi
+
 export non_admin_connect_string="${conn_string}"
-
-if [ ! -f ./misc/mystat_slob.pl ]
-then
-	msg WARNING "No mystat_slob.pl file in ./misc."
-	MYSTAT_SLOB=FALSE
-	return 1
-else
-	MYSTAT_SLOB=TRUE
-fi
+export admin_connect_string="${conn_string}"
 
 # The following is the first screen output
 msg NOTIFY " "
@@ -262,27 +288,17 @@ non_admin_connect_string == \"$non_admin_connect_string\"
 "
 
 msg NOTIFY "Verifying connectivity."
-msg NOTIFY "Testing mysql connectivity to validate slob.conf settings."
+msg NOTIFY "Testing db2 connectivity to validate slob.conf settings."
 
-if ( ! test_conn ${admin_connect_string} )
+if ( ! test_conn ${admin_connect_string}  >> $LOG 2>&1  )
 then
-    msg FATAL "${0}: cannot connect to mysql."
-	msg FATAL "Connect string: mysql \"${admin_connect_string}\""
+    msg FATAL "${0}: cannot connect to db2."
+	msg FATAL "Connect string: db2 \"${admin_connect_string}\""
     msg FATAL "Please verify the root password in slob.conf are correct for your connectivity model."
 	msg FATAL "SLOB abnormal end."
     exit 1
 fi
 
-for U in  1 ${sessions} 
-do
-	msg NOTIFY "Testing connectivity for user${U}"	
-	if ( !  test_conn "-uuser${U} -puser${U} ${non_admin_connect_string}" )
-	then
-		msg FATAL "Connect failure mysql -uuser${U} -puser${U}"
-		msg FATAL "SLOB abnormal end."
-		exit 1
-	fi
-done
 
 msg NOTIFY "Connectivity verified."
 
@@ -311,25 +327,24 @@ cnt=1 ; x=0 ; instance=1 ; sessions_per_instance=0
 
 until [ $cnt -gt $sessions ]
 do
-    cmd="mysql -uuser${cnt} -puser${cnt} ${non_admin_connect_string}"
-    slobargs="system ./mywait; use user${cnt}; call slob($UPDATE_PCT, $WORK_LOOP, $RUN_TIME, $SCALE, $WORK_UNIT, '$REDO_STRESS', $SHARED_DATA_MODULUS, $DO_UPDATE_HOTSPOT, $HOTSPOT_PCT, $THINK_TM_MODULUS, $THINK_TM_MIN, $THINK_TM_MAX)"
+    cmd="db2 ${non_admin_connect_string}"
+    slobargs="!./mywait; set schema user${cnt}; call user${cnt}.slob($UPDATE_PCT, $WORK_LOOP, $RUN_TIME, $SCALE, $WORK_UNIT, '$REDO_STRESS', $SHARED_DATA_MODULUS, $DO_UPDATE_HOTSPOT, $HOTSPOT_PCT, $THINK_TM_MODULUS, $THINK_TM_MIN, $THINK_TM_MAX)"
+    echo $slobargs
 
-	( $cmd -e "$slobargs" >> $debug_outfile 2>&1 ) &
+	( ( $cmd; db2 -t <<EOF
+!./mywait;
+set schema user${cnt};
+call user${cnt}.slob($UPDATE_PCT, $WORK_LOOP, $RUN_TIME, $SCALE, $WORK_UNIT, '$REDO_STRESS', $SHARED_DATA_MODULUS, $DO_UPDATE_HOTSPOT, $HOTSPOT_PCT, $THINK_TM_MODULUS, $THINK_TM_MIN, $THINK_TM_MAX);
+EOF
+) >> $debug_outfile 2>&1 ) &
 
-	mysql_pids="${mysql_pids} $!"
+	db2_pids="${db2_pids} $!"
 
 	(( cnt = $cnt + 1 ))
 	(( x = $cnt % 17 ))
 	[[ $x -eq 0 ]] && sleep 1
 done
 
-if [ "$MYSTAT_SLOB" = "TRUE" ]
-then
-	cd misc
-	./create_sem > /dev/null 2>&1
-	perl ./mystat_slob.pl -i 60 -n all -h 127.0.0.1 -u user1 -p user1 > ../mystat.out 2>/tmp/mystat_debug.out &
-	cd ..
-fi
 msg NOTIFY " "
 
 if [[  $(( cnt / 6 )) -gt 5 ]]
@@ -344,9 +359,11 @@ then
 	msg NOTIFY "Pausing for $sleep_secs seconds before triggering the test."
 	sleep $sleep_secs
 else
-    sleep 1
+    sleep 5
 fi
 
+
+reset_snapshot "$admin_connect_string" ${DB_NAME} > snapshot.out
 # Switch output to fd2 so $misc_pids shell kill feedback falls in line
 
 msg NOTIFY " "
@@ -356,23 +373,17 @@ before=$SECONDS
 
 ./trigger > /dev/null 2>&1
 
-if ( ! wait_pids "$sessions" "$RUN_TIME" "$WORK_LOOP" "$mysql_pids" )
+if ( ! wait_pids "$sessions" "$RUN_TIME" "$WORK_LOOP" "$db2_pids" )
 then
 	msg FATAL "This is not a successful SLOB test." >&2
 	exit 1
 fi
 
+get_snapshot "$admin_connect_string" ${DB_NAME} >> snapshot.out
 (( tm =  $SECONDS - $before ))
 
 msg NOTIFY "Run time in seconds was:  $tm" >&2
 echo "Tm $tm" > tm.out
-
-if [ "$MYSTAT_SLOB" = "TRUE" ]
-then
-	cd misc
-	./trigger > /dev/null 2>&1
-	cd ..
-fi
 
 sleep 1
 
